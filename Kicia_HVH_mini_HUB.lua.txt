@@ -1,0 +1,1739 @@
+--!native
+--!optimize 2
+
+-- [[ 1. Item Data Modification (Fast Fire & Fast Melee) ]] --
+if game.GameId == 6035872082 then
+    local Storage = game:GetService("ReplicatedStorage")
+    local ItemLibrary = Storage:FindFirstChild("Modules") and Storage.Modules:FindFirstChild("ItemLibrary")
+    if ItemLibrary then
+        local Items = require(ItemLibrary).Items
+        
+        -- Fast Fire (Guns)
+        local gunExceptions = { ["Sniper"] = false, ["Crossbow"] = false, ["Bow"] = false, ["RPG"] = false }
+        for name, data in pairs(Items) do
+            if typeof(data) == "table" and not gunExceptions[name] then
+                if data.ShootSpread then data.ShootSpread = 0 end
+                if data.ShootAccuracy then data.ShootAccuracy = 0 end
+                if data.ShootRecoil then data.ShootRecoil = 0 end
+                if data.ShootCooldown then data.ShootCooldown = 0.001 end
+                if data.ShootBurstCooldown then data.ShootBurstCooldown = 0.001 end
+            end
+        end
+
+        -- Fast Melee
+        for name, data in pairs(Items) do
+            if typeof(data) == "table" then
+                if data.AttackCooldown then data.AttackCooldown = 0.001 end
+                if data.SwingCooldown then data.SwingCooldown = 0.001 end
+                if data.MeleeCooldown then data.MeleeCooldown = 0.001 end
+                if data.Cooldown then data.Cooldown = 0.001 end
+                if data.RecoveryTime then data.RecoveryTime = 0.001 end
+                if data.ResetTime then data.ResetTime = 0.001 end
+            end
+        end
+    end
+end
+
+-- [[ 2. Core Services & Variables ]] --
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local _cloneref = cloneref or function(x) return x end
+local _clonefunction = clonefunction or function(x) return x end
+cloneref = _cloneref
+clonefunction = _clonefunction
+
+local TargetPos = CFrame.new(9000, 9000, 9000)
+local Projectiles = {}
+local currentTarget = nil
+
+-- Toggles & TP Modes
+local RageEnabled = true
+local KickEnabled = false
+local TpMode = 0 -- 0: OFF, 1: Target Y (追従), 2: Fixed Y
+local FastMeleeEnabled = true
+local RapidFireEnabled = false
+local UndergroundEnabled = true -- ★めり込み機能のON/OFF
+
+-- 地面にめり込ませる深さ（1メートル ≒ 約-3.28 studs）
+local UndergroundOffset = -3.28
+local FixedYPosition = nil -- モード2用の固定Y座標保存変数
+
+-- Raycast用パラメータの設定（自分自身を検知除外）
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+raycastParams.IgnoreWater = true
+
+-- [[ 地面判定・めり込み計算関数 ]] --
+local function GetGroundY(position, ignoreChar)
+    if ignoreChar then
+        raycastParams.FilterDescendantsInstances = {ignoreChar}
+    end
+    -- 現在位置から下方向15studsにレイを照射して地面を探す
+    local rayResult = workspace:Raycast(position + Vector3.new(0, 2, 0), Vector3.new(0, -15, 0), raycastParams)
+    if rayResult then
+        return rayResult.Position.Y
+    end
+    return position.Y - 3 -- 地面が見つからない場合のフォールバック値
+end
+
+-- [[ 2.1 Rapid Fire Modules & Functions ]] --
+local Utility, EnumLibrary, FC, GunModule, MeleeModule, UseItem
+
+local function sreq(inst)
+	if not inst then return nil end
+	local ok, m = pcall(require, inst)
+	return ok and m or nil
+end
+
+local function refreshRF()
+	local mod = ReplicatedStorage:FindFirstChild("Modules")
+	Utility = Utility or sreq(mod and mod:FindFirstChild("Utility"))
+	EnumLibrary = EnumLibrary or sreq(mod and mod:FindFirstChild("EnumLibrary"))
+	local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+	local ctr = ps and ps:FindFirstChild("Controllers")
+	FC = FC or sreq(ctr and ctr:FindFirstChild("FighterController"))
+	local it = ps and ps:FindFirstChild("Modules")
+	it = it and it:FindFirstChild("ItemTypes")
+	GunModule = GunModule or sreq(it and it:FindFirstChild("Gun"))
+	MeleeModule = MeleeModule or sreq(it and it:FindFirstChild("Melee"))
+	local r = ReplicatedStorage:FindFirstChild("Remotes")
+	r = r and r:FindFirstChild("Replication")
+	r = r and r:FindFirstChild("Fighter")
+	UseItem = UseItem or (r and r:FindFirstChild("UseItem"))
+end
+
+local function forceZeroInfo(info)
+	if type(info) ~= "table" then return end
+	for k, v in pairs(info) do
+		if type(v) == "number" then
+			local lk = string.lower(tostring(k))
+			if string.find(lk, "cool") or string.find(lk, "delay") or string.find(lk, "rate")
+				or string.find(lk, "interval") or string.find(lk, "ready") or string.find(lk, "wait")
+				or string.find(lk, "shoot") or string.find(lk, "attack") or string.find(lk, "fire")
+				or string.find(lk, "shot") or string.find(lk, "swing") or string.find(lk, "semi")
+				or string.find(lk, "chamber") then
+				info[k] = 0
+			end
+		end
+	end
+	for _, k in ipairs({
+		"ShootCooldown", "ShotCooldown", "FireCooldown", "FireRate", "Cooldown",
+		"AttackCooldown", "SwingCooldown", "HitCooldown", "DelayBetweenShots",
+		"TimeBetweenShots", "MinShootInterval", "NextShotTime", "ChamberTime",
+		"PumpTime", "BoltTime", "CycleTime",
+	}) do
+		if type(info[k]) == "number" then info[k] = 0 end
+	end
+end
+
+local function isHoldingFire()
+	local holding = false
+	pcall(function()
+		holding = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+			or UIS:IsKeyDown(Enum.KeyCode.ButtonR2)
+	end)
+	if not holding then
+		pcall(function()
+			for _, t in ipairs(UIS:GetTouches()) do
+				if t then holding = true break end
+			end
+		end)
+	end
+	return holding
+end
+
+-- Rapid Fire Hook Init
+task.spawn(function()
+	for _ = 1, 25 do
+		refreshRF()
+		if GunModule and GunModule.StartShooting then break end
+		task.wait(0.2)
+	end
+	if GunModule and GunModule.StartShooting then
+		local prev = GunModule.StartShooting
+		GunModule.StartShooting = function(self, ...)
+			if RapidFireEnabled then
+				pcall(function() if self.Info then forceZeroInfo(self.Info) end end)
+			end
+			local r = { prev(self, ...) }
+			if RapidFireEnabled then
+				pcall(function() if self.Info then forceZeroInfo(self.Info) end end)
+			end
+			return unpack(r)
+		end
+	end
+	if MeleeModule and MeleeModule.StartShooting then
+		local prevM = MeleeModule.StartShooting
+		MeleeModule.StartShooting = function(self, ...)
+			if RapidFireEnabled then
+				pcall(function() if self.Info then forceZeroInfo(self.Info) end end)
+			end
+			local r = { prevM(self, ...) }
+			if RapidFireEnabled then
+				pcall(function() if self.Info then forceZeroInfo(self.Info) end end)
+			end
+			return unpack(r)
+		end
+	end
+end)
+
+-- [[ 3. Kicia Ragebot Core Logic ]] --
+local Char, Root
+local function refreshCharacter()
+    Char = LocalPlayer.Character
+    Root = Char and Char:FindFirstChild("HumanoidRootPart") or nil
+    return Char
+end
+refreshCharacter()
+LocalPlayer.CharacterAdded:Connect(function(character)
+    Char = character
+    Root = character:WaitForChild("HumanoidRootPart", 10)
+end)
+
+local Bridge = {}
+function Bridge.IsReadyToFight() return true end
+local Options = {}
+local Toggles = {}
+local FighterDataCache = { LocalDuel = { Seeded = false, IsInShootingRange = false } }
+local Genv = (type(getgenv) == "function" and getgenv()) or _G
+Genv.KiciaHookCaps = Genv.KiciaHookCaps or {}
+Genv.KiciaHookCaps.gate = Genv.KiciaHookCaps.gate or function()
+    return type(getgc) == "function" and type(sethiddenproperty) == "function"
+end
+local function GetChar()
+    if not Char or not Char.Parent then refreshCharacter() end
+    return Char
+end
+local function GetRoot()
+    local character = GetChar()
+    Root = character and character:FindFirstChild("HumanoidRootPart") or Root
+    return Root
+end
+
+local function initKicia(ctx)
+    local RivalsRuntimeBridge = ctx.RivalsRuntimeBridge
+    local Options = ctx.Options
+    local Toggles = ctx.Toggles
+    local FighterDataCache = ctx.FighterDataCache
+    local GetChar = ctx.GetChar
+    local GetRoot = ctx.GetRoot
+    local __kicia_hook_genv = ctx.Genv
+
+    local KiciaRagebot = {}
+    RivalsRuntimeBridge.KiciaRagebot = KiciaRagebot
+
+    local RunServiceRB = game:GetService('RunService')
+    local HttpServiceRB = cloneref(game:GetService('HttpService'))
+    local CollectionServiceRB = cloneref(game:GetService('CollectionService'))
+    local PlayersRB = cloneref(game:GetService('Players'))
+    local ReplicatedStorageRB = cloneref(game:GetService('ReplicatedStorage'))
+    local WorkspaceRB = workspace
+    local LPRB = PlayersRB.LocalPlayer
+    local rbRandom = Random.new()
+
+    local rbSetHidden = sethiddenproperty
+    local rbSetFFlag = (type(setfflag) == 'function') and setfflag or sfflag
+    local rbSetThreadIdentity = setthreadidentity
+    local rbGetThreadIdentity = getthreadidentity
+
+    local rbCleanFireEvent = Instance.new('RemoteEvent')
+    local rbFireServerNative = clonefunction(rbCleanFireEvent.FireServer)
+
+    local function rbRawWrite(obj, key, value)
+        if typeof(obj) == 'Instance' then
+            if not pcall(rbSetHidden, obj, key, value) then
+                pcall(function() obj[key] = value end)
+            end
+        else
+            pcall(rawset, obj, key, value)
+        end
+    end
+
+    local function optValue(id, default)
+        local o = Options and Options[id]
+        if o and o.Value ~= nil then return o.Value end
+        return default
+    end
+    local function togValue(id, default)
+        local t = Toggles and Toggles[id]
+        if t and t.Value ~= nil then return t.Value == true end
+        return default
+    end
+    local Setting = {
+        Stability = function() return optValue('P8S4S1', 1.5) end,
+        ShootFrames = function() return optValue('P8S4S2', 1) end,
+        PrioritizeHackers = function() return togValue('P8S4T4', true) end,
+        WeaponPrimary = function() return togValue('P8S4T5', true) end,
+        WeaponSecondary = function() return togValue('P8S4T6', true) end,
+        WeaponMelee = function() return togValue('P8S4T7', true) end,
+        OnEmpty = function() return optValue('P8S4D1', 'SwapOrReload') end,
+        EvasionMode = function() return optValue('P8S4D2', 'Random') end,
+        TranslocateOffset = function() return optValue('P8S4S3', -5) end,
+        RandomBaseRadius = function() return optValue('P8S4S4', 100000000) end,
+        RandomRadiusFactor = function() return optValue('P8S4S5', 1) end,
+        RandomAnchorFromCharacter = function() return togValue('P8S4T8', false) end,
+        RepositionInterval = function() return 0.3 end,
+    }
+
+    local PB_DEPTH_FORWARD = { Min = 0, Max = 4 }
+    local PB_DEPTH_FORWARD_FREQ = 5
+    local PB_DEPTH_UP = { Min = 0, Max = 5.5 }
+    local PB_DEPTH_UP_FREQ = 5
+    local PB_FALLBACK_BASE_RADIUS = 100
+    local PB_FALLBACK_RADIUS_FACTOR = 0.5
+    local PB_FALLBACK_ANCHOR_FROM_CHARACTER = false
+
+    local function findChild(root, ...)
+        local node = root
+        for _, name in ipairs({ ... }) do
+            if not node then return nil end
+            node = node:FindFirstChild(name)
+        end
+        return node
+    end
+
+    local cachedEnumLibrary = nil
+    local function resolveEnumLibrary()
+        if cachedEnumLibrary then return cachedEnumLibrary end
+        local mod = findChild(ReplicatedStorageRB, 'Modules', 'EnumLibrary')
+        if not mod then return nil end
+        local ok, lib = pcall(require, mod)
+        if ok and type(lib) == 'table' then
+            cachedEnumLibrary = lib
+            return lib
+        end
+        return nil
+    end
+    local function enc(name)
+        local lib = resolveEnumLibrary()
+        if not lib then return nil end
+        local ok, token = pcall(lib.ToEnum, lib, name)
+        if ok then return token end
+        return nil
+    end
+
+    local cachedUseItemRemote = nil
+    local function resolveUseItemRemote()
+        if cachedUseItemRemote and cachedUseItemRemote.Parent then return cachedUseItemRemote end
+        local remote = findChild(ReplicatedStorageRB, 'Remotes', 'Replication', 'Fighter', 'UseItem')
+        if remote and remote:IsA('RemoteEvent') then
+            cachedUseItemRemote = cloneref(remote)
+            return cachedUseItemRemote
+        end
+        return nil
+    end
+    local cachedUpdateStateRemote = nil
+    local function resolveUpdateStateRemote()
+        if cachedUpdateStateRemote and cachedUpdateStateRemote.Parent then return cachedUpdateStateRemote end
+        local remote = findChild(ReplicatedStorageRB, 'Remotes', 'Replication', 'Fighter', 'UpdateState')
+        if remote and remote:IsA('RemoteEvent') then
+            cachedUpdateStateRemote = cloneref(remote)
+            return cachedUpdateStateRemote
+        end
+        return nil
+    end
+    local cachedCameraRotationRemote = nil
+    local function resolveCameraRotationRemote()
+        if cachedCameraRotationRemote and cachedCameraRotationRemote.Parent then return cachedCameraRotationRemote end
+        local remote = findChild(ReplicatedStorageRB, 'Remotes', 'Replication', 'Fighter', 'UpdateCameraRotation')
+        if remote and remote:IsA('RemoteEvent') then
+            cachedCameraRotationRemote = cloneref(remote)
+            return cachedCameraRotationRemote
+        end
+        return nil
+    end
+    local function requireModuleRB(name)
+        local mod = findChild(ReplicatedStorageRB, 'Modules', name)
+        if not mod then return nil end
+        local ok, result = pcall(require, mod)
+        if ok then return result end
+        return nil
+    end
+
+    local cachedFighterController = nil
+    local function resolveFighterController()
+        local cc = cachedFighterController
+        if type(cc) == 'table' and rawget(cc, 'LocalFighter') ~= nil then return cc end
+        for _, m in ipairs(getgc(true)) do
+            if type(m) == 'table' and rawget(m, 'LocalFighter') ~= nil and rawget(m, 'Objects') ~= nil then
+                cachedFighterController = m
+                return m
+            end
+        end
+        return nil
+    end
+    local function resolveLocalFighter()
+        local controller = resolveFighterController()
+        return controller and rawget(controller, 'LocalFighter') or nil
+    end
+    local cachedFCPrototype = nil
+    local function resolveFighterControllerPrototype()
+        if type(cachedFCPrototype) == 'table' and rawget(cachedFCPrototype, '_CameraReplicationLoop') ~= nil then return cachedFCPrototype end
+        local controller = resolveFighterController()
+        if controller then
+            local mt = getmetatable(controller)
+            local proto = mt and rawget(mt, '__index') or nil
+            if type(proto) == 'table' and rawget(proto, '_CameraReplicationLoop') ~= nil then
+                cachedFCPrototype = proto
+                return proto
+            end
+        end
+        for _, m in ipairs(getgc(true)) do
+            if type(m) == 'table' then
+                local idx = rawget(m, '__index')
+                if type(idx) == 'table' and rawget(idx, '_CameraReplicationLoop') ~= nil then
+                    cachedFCPrototype = idx
+                    return idx
+                end
+            end
+        end
+        return nil
+    end
+
+    local function fireGun(objectId, isRaycast, aim1, aim2, hitboxHead, extra)
+        local remote = resolveUseItemRemote()
+        local token = enc('StartShooting')
+        if not remote or not token or not objectId then return end
+        local inner = { ['\0'] = aim1, ['\1'] = aim2, ['\2'] = hitboxHead, ['\3'] = extra }
+        local payload = isRaycast and { ['\1'] = inner, ['\2'] = true } or { ['\1'] = inner }
+        rbFireServerNative(remote, objectId, token, payload, nil)
+    end
+    local function fireMeleeAttack(objectId, a, b, c, d)
+        local remote = resolveUseItemRemote()
+        local token = enc('StartShooting')
+        local anim = enc('AttackAnimation1')
+        if not remote or not token or not anim or not objectId then return end
+        rbFireServerNative(remote, objectId, token, { ['\1'] = { ['\0'] = a, ['\1'] = b, ['\2'] = c, ['\3'] = d }, ['\2'] = anim }, nil)
+    end
+    local function fireMeleeHeavy(objectId, a, b, c, d)
+        local remote = resolveUseItemRemote()
+        local token = enc('StartAiming')
+        local anim = enc('HeavyAttackAnimation1')
+        if not remote or not token or not anim or not objectId then return end
+        rbFireServerNative(remote, objectId, token, { ['\1'] = { ['\0'] = a, ['\1'] = b, ['\2'] = c, ['\3'] = d }, ['\2'] = anim }, nil)
+    end
+    local function fireReload(objectId)
+        local remote = resolveUseItemRemote()
+        local start = enc('StartReloading')
+        local reload = enc('Reload')
+        if not remote or not start or not reload or not objectId then return end
+        rbFireServerNative(remote, objectId, start, { ['\1'] = reload, ['\2'] = reload }, nil)
+    end
+
+    local function itemObjectId(item)
+        local data = rawget(item, 'Data')
+        return data and rawget(data, 'ObjectID') or nil
+    end
+    local function itemInfo(item) return rawget(item, 'Info') end
+    local function itemType(item)
+        local info = itemInfo(item)
+        return info and rawget(info, 'Type') or nil
+    end
+    local function itemIsRaycast(item)
+        local info = itemInfo(item)
+        return info and rawget(info, 'IsRaycast') == true
+    end
+    local function itemName(item) return rawget(item, 'Name') or rawget(item, 'ItemName') end
+    local function itemAmmo(item)
+        local data = rawget(item, 'Data')
+        local ammo = data and rawget(data, 'Ammo')
+        return type(ammo) == 'number' and ammo or 0
+    end
+    local function itemAmmoReserve(item)
+        local data = rawget(item, 'Data')
+        local reserve = data and rawget(data, 'AmmoReserve')
+        return type(reserve) == 'number' and reserve or math.huge
+    end
+    local function itemIsReloading(item)
+        local now = tick()
+        local cooldown = rawget(item, '_reload_cooldown')
+        if type(cooldown) == 'number' and now < cooldown then return true end
+        local noAmmoCooldown = rawget(item, '_shoot_cooldown_no_ammo')
+        return type(noAmmoCooldown) == 'number' and now < noAmmoCooldown
+    end
+    local function itemIsMagFull(item)
+        local info = itemInfo(item)
+        local maxAmmo = info and rawget(info, 'MaxAmmo')
+        return type(maxAmmo) == 'number' and maxAmmo <= itemAmmo(item)
+    end
+    local function itemIsEquipped(item) return rawget(item, 'IsEquipped') end
+    local function equipItem(item, index)
+        if itemIsEquipped(item) then return end
+        local clientFighter = rawget(item, 'ClientFighter')
+        if clientFighter and index and type(clientFighter.EquipItem) == 'function' then
+            pcall(function() clientFighter:EquipItem(index) end)
+        end
+    end
+    local function reloadItem(item)
+        if itemIsReloading(item) or itemAmmoReserve(item) <= 0 or itemIsMagFull(item) then return end
+        fireReload(itemObjectId(item))
+    end
+
+    local NEG_HUGE = -9e37
+    local function buildAim(base, pitch, oy, oz)
+        return { ['\0'] = base['\0'], ['\1'] = base['\1'], ['\2'] = base['\2'], ['\3'] = pitch, ['\4'] = oy, ['\5'] = oz }
+    end
+    local AIM_ABOVE_ORIGIN = { ['\0'] = NEG_HUGE, ['\1'] = 0, ['\2'] = 0 }
+    local AIM_ABOVE_END = { ['\0'] = 0, ['\1'] = -90000000, ['\2'] = 0 }
+    local AIM_BELOW_ORIGIN = { ['\0'] = NEG_HUGE, ['\1'] = 0, ['\2'] = 0 }
+    local AIM_BELOW_END = { ['\0'] = 0, ['\1'] = 90000000, ['\2'] = 0 }
+    local AIM_EXTRA = { ['\0'] = 0, ['\1'] = 1, ['\2'] = 0, ['\3'] = 0, ['\4'] = 0, ['\5'] = 0 }
+    local OFFSET_ABOVE = Vector3.new(0, -0.7, 0.05)
+    local OFFSET_BELOW = Vector3.new(0, -3.85, 0.05)
+    local PITCH_ABOVE = -math.pi / 2
+    local PITCH_BELOW = math.pi / 2
+
+    local function classifyAboveBelow(target)
+        local obs = target and target.itemObserver
+        if obs then
+            local ok, result = pcall(function()
+                local equipped = obs:GetEquippedItem()
+                if equipped ~= nil and equipped.name == 'Riot Shield' then
+                    local pitch = math.deg(target:GetCameraRotation().X)
+                    if 22 < pitch and pitch < 91 then return 'Below' end
+                    return 'Above'
+                end
+                for _, it in obs:GetItems() do
+                    if it.name == 'Riot Shield' then
+                        local pitch = math.deg(target:GetCameraRotation().X)
+                        if (315 < pitch and pitch < 360) or (0 < pitch and pitch < 91) then return 'Above' end
+                        return 'Below'
+                    end
+                end
+                return 'None'
+            end)
+            if ok and result then return result end
+        end
+        return 'None'
+    end
+    local function isAbove(target) return classifyAboveBelow(target) ~= 'Below' end
+
+    local RootDesync = {}
+    RootDesync.__index = RootDesync
+    function RootDesync.new(rootPart)
+        local self = setmetatable({
+            _rootPart = rootPart,
+            _boundId = HttpServiceRB:GenerateGUID(false),
+            _oldCFrame = rootPart.CFrame,
+            _cframe = nil,
+        }, RootDesync)
+        RunServiceRB:BindToRenderStep(self._boundId, Enum.RenderPriority.First.Value, function()
+            self:_RenderStepUpdate()
+        end)
+        return self
+    end
+    function RootDesync:_RenderStepUpdate()
+        local old = self._oldCFrame
+        if old ~= nil then
+            self._rootPart.CFrame = old
+            self._oldCFrame = nil
+        end
+    end
+    function RootDesync:SetServerCFrame(cf) self._cframe = cf end
+    function RootDesync:GetServerCFrame() return self._cframe or self._rootPart.CFrame end
+    function RootDesync:GetClientCFrame() return self._oldCFrame or self._rootPart.CFrame end
+    function RootDesync:HeartbeatUpdate()
+        local cf = self._cframe
+        if cf ~= nil then
+            self._oldCFrame = self._rootPart.CFrame
+            self._rootPart.CFrame = cf
+        end
+    end
+    function RootDesync:Destroy()
+        pcall(function() RunServiceRB:UnbindFromRenderStep(self._boundId) end)
+    end
+
+    local function encodeSingle(n)
+        if n == n then
+            return utf8.char(math.clamp(math.floor(n % (2 * math.pi) / math.pi / 2 * 256 + 0.5), 0, 255))
+        end
+        return utf8.char(0)
+    end
+    local function encodeCameraRotation(v)
+        if v == v then
+            return utf8.char(math.clamp(math.floor(v.X % (2 * math.pi) / math.pi / 2 * 256 + 0.5), 0, 255))
+                .. utf8.char(math.clamp(math.floor(v.Y % (2 * math.pi) / math.pi / 2 * 256 + 0.5), 0, 255))
+        end
+        return utf8.char(0) .. utf8.char(0)
+    end
+    local function decodeSingle(s) return utf8.codepoint(s) * math.pi * 2 / 256 end
+    local function anglesToRaw(a)
+        if a.kind == 'Unnormalized' then return Vector2.new(a.pitch, 0) * math.pi * 2 / 256 end
+        return Vector2.new(decodeSingle(encodeSingle(math.rad(a.pitch))), decodeSingle(encodeSingle(math.rad(a.yaw))))
+    end
+    local function anglesToEncoded(a)
+        if a.kind == 'Unnormalized' then return utf8.char(math.clamp(a.pitch, 0, 255)) .. utf8.char(math.clamp(a.yaw, 0, 255)) end
+        return encodeSingle(math.rad(a.pitch)) .. encodeSingle(math.rad(a.yaw))
+    end
+
+    local ViewAngleDriver = {}
+    ViewAngleDriver.__index = ViewAngleDriver
+    function ViewAngleDriver.new()
+        return setmetatable({ _slots = {}, _winning = nil, _fullySuppressed = false, _dirty = false }, ViewAngleDriver)
+    end
+    function ViewAngleDriver:_Resolve()
+        local best, winner = nil, nil
+        for priority, value in pairs(self._slots) do
+            if value ~= nil and (best == nil or priority > best) then
+                best = priority
+                winner = value
+            end
+        end
+        self._winning = winner
+    end
+    function ViewAngleDriver:_LoadJointsHook()
+        if self._jointsRestore ~= nil then return true end
+        local joints = requireModuleRB('ClientFighterCharacterJoints')
+        local original = joints and rawget(joints, 'Update') or nil
+        if not joints or original == nil then return false end
+        local driver = self
+        local function hooked(jointsSelf, a, b)
+            local cfc = rawget(jointsSelf, 'ClientFighterCharacter')
+            local cf = cfc and rawget(cfc, 'ClientFighter') or nil
+            if cf == nil then return original(jointsSelf, a, b) end
+            if rawget(cf, 'IsLocalPlayer') == true then
+                local winning = driver._winning
+                if winning ~= nil then rbRawWrite(b, 'CameraRotationRaw', anglesToRaw(winning)) end
+            end
+            return original(jointsSelf, a, b)
+        end
+        rawset(joints, 'Update', hooked)
+        self._jointsRestore = { joints = joints, original = original }
+        return true
+    end
+    function ViewAngleDriver:_LoadReplicationHook()
+        if self._replicationRestore ~= nil then return true end
+        local proto = resolveFighterControllerPrototype()
+        local instance = resolveFighterController()
+        local loop = proto and rawget(proto, '_CameraReplicationLoop') or nil
+        if not proto or not instance or loop == nil then return false end
+        local utilIndex, util
+        local ok, upvalues = pcall(debug.getupvalues, loop)
+        if ok and type(upvalues) == 'table' then
+            for index, value in pairs(upvalues) do
+                if type(value) == 'table' then
+                    local vmt = getmetatable(value)
+                    local vidx = vmt and rawget(vmt, '__index') or nil
+                    if vidx ~= nil and rawget(vidx, 'EncodeCameraRotation') ~= nil then
+                        util = value
+                        utilIndex = index
+                        break
+                    end
+                end
+            end
+        end
+        if utilIndex == nil or util == nil then return false end
+        local driver = self
+        local replacement = {}
+        function replacement.EncodeCameraRotation(_, raw)
+            if next(driver._slots) == nil and not driver._fullySuppressed then return encodeCameraRotation(raw) end
+            rbRawWrite(instance, '_replication_stopped', false)
+            local last = rawget(instance, '_last_encoded_camera_rotation')
+            if not last then last = encodeCameraRotation(raw) end
+            return last
+        end
+        if not pcall(debug.setupvalue, loop, utilIndex, replacement) then return false end
+        self._replicationRestore = { loop = loop, utilityIndex = utilIndex, utility = util }
+        return true
+    end
+    function ViewAngleDriver:SendViewAngles(priority, value)
+        if self._slots[priority] == value then return end
+        self._slots[priority] = value
+        self._dirty = true
+        self:_Resolve()
+        if self._winning == nil then return end
+        if self:_LoadJointsHook() then self:_LoadReplicationHook() end
+    end
+    function ViewAngleDriver:Flush()
+        if not self._dirty or self._fullySuppressed then return end
+        local winning = self._winning
+        if winning == nil then self._dirty = false; return end
+        self._dirty = false
+        local remote = resolveCameraRotationRemote()
+        if remote then rbFireServerNative(remote, anglesToEncoded(winning), nil) end
+    end
+    function ViewAngleDriver:ClearAll()
+        table.clear(self._slots)
+        self._winning = nil
+        self._dirty = false
+    end
+    function ViewAngleDriver:Destroy()
+        local jointsRestore = self._jointsRestore
+        if jointsRestore ~= nil then
+            self._jointsRestore = nil
+            pcall(rawset, jointsRestore.joints, 'Update', jointsRestore.original)
+        end
+        local replicationRestore = self._replicationRestore
+        if replicationRestore ~= nil then
+            self._replicationRestore = nil
+            pcall(debug.setupvalue, replicationRestore.loop, replicationRestore.utilityIndex, replicationRestore.utility)
+        end
+    end
+
+    local CharacterController = {}
+    CharacterController.__index = CharacterController
+    function CharacterController.new(rootPart)
+        return setmetatable({
+            _rootDesync = RootDesync.new(rootPart),
+            _viewAngleDriver = ViewAngleDriver.new(),
+        }, CharacterController)
+    end
+    function CharacterController:SetServerCFrame(cf)
+        if self._rootDesync then self._rootDesync:SetServerCFrame(cf) end
+    end
+    function CharacterController:GetClientCFrame()
+        return self._rootDesync and self._rootDesync:GetClientCFrame() or nil
+    end
+    function CharacterController:SendViewAngles(priority, value) self._viewAngleDriver:SendViewAngles(priority, value) end
+    function CharacterController:HeartbeatUpdate()
+        if self._rootDesync then self._rootDesync:HeartbeatUpdate() end
+        self._viewAngleDriver:Flush()
+    end
+    function CharacterController:Destroy()
+        self._viewAngleDriver:ClearAll()
+        self._viewAngleDriver:Destroy()
+        if self._rootDesync then
+            self._rootDesync:Destroy()
+            self._rootDesync = nil
+        end
+    end
+
+    local StateHook = {}
+    StateHook.__index = StateHook
+    function StateHook.new() return setmetatable({ _forced = {} }, StateHook) end
+    function StateHook:SetForced(name, value)
+        local token = enc(name)
+        if token == nil or self._forced[token] == value then return end
+        local remote = resolveUpdateStateRemote()
+        if not remote then return end
+        self._forced[token] = value
+        rbFireServerNative(remote, token, value, nil)
+    end
+    function StateHook:ClearForced(name, offValue)
+        local token = enc(name)
+        if token == nil or self._forced[token] == nil then return end
+        self._forced[token] = nil
+        local remote = resolveUpdateStateRemote()
+        if remote then rbFireServerNative(remote, token, offValue, nil) end
+    end
+
+    local VOID_CFRAME = CFrame.new(math.random(-100000, -10000), 100000, math.random(-100000, 10000))
+    local PartGlue = {}
+    PartGlue.__index = PartGlue
+    function PartGlue.new() return setmetatable({ _gluedParts = {}, _bindings = {} }, PartGlue) end
+    function PartGlue:_SetupGlue(part)
+        local entry = self._gluedParts[part]
+        if entry ~= nil then
+            entry.refCount = entry.refCount + 1
+            return
+        end
+        local weld = part:FindFirstChildOfClass('WeldConstraint')
+        local originalPart1 = nil
+        if weld ~= nil then
+            originalPart1 = weld.Part1
+            if originalPart1 ~= nil then weld.Part1 = nil end
+            part.Anchored = true
+        end
+        self._gluedParts[part] = { refCount = 1, weld = weld, originalPart1 = originalPart1 }
+    end
+    function PartGlue:_ReleaseGlue(part)
+        local entry = self._gluedParts[part]
+        if entry == nil then return end
+        entry.refCount = entry.refCount - 1
+        if 0 < entry.refCount then return end
+        local weld = entry.weld
+        if weld ~= nil and entry.originalPart1 ~= nil then
+            weld.Part1 = entry.originalPart1
+            entry.originalPart1.Anchored = false
+        end
+        self._gluedParts[part] = nil
+    end
+    function PartGlue:Acquire(ourPart, hitboxPart, useRotation)
+        local prev = rbGetThreadIdentity()
+        rbSetThreadIdentity(8)
+        pcall(rbSetHidden, ourPart, 'PhysicsRepRootPart', hitboxPart)
+        rbSetThreadIdentity(prev)
+        local bound = self._bindings[ourPart]
+        if bound ~= hitboxPart then
+            if bound ~= nil then self:_ReleaseGlue(bound) end
+            self:_SetupGlue(hitboxPart)
+            self._bindings[ourPart] = hitboxPart
+        end
+        local cf = CFrame.new(VOID_CFRAME.Position)
+        if useRotation then cf = cf * hitboxPart.CFrame.Rotation end
+        hitboxPart.CFrame = cf
+        return VOID_CFRAME
+    end
+    function PartGlue:Free(ourPart)
+        local bound = self._bindings[ourPart]
+        if bound == nil then return end
+        self._bindings[ourPart] = nil
+        self:_ReleaseGlue(bound)
+        local prev = rbGetThreadIdentity()
+        rbSetThreadIdentity(8)
+        pcall(rbSetHidden, ourPart, 'PhysicsRepRootPart', nil)
+        rbSetThreadIdentity(prev)
+    end
+    function PartGlue:Destroy()
+        for _, entry in pairs(self._gluedParts) do
+            local weld = entry.weld
+            if weld ~= nil and entry.originalPart1 ~= nil then
+                pcall(function()
+                    weld.Part1 = entry.originalPart1
+                    entry.originalPart1.Anchored = false
+                end)
+            end
+        end
+        table.clear(self._gluedParts)
+        table.clear(self._bindings)
+    end
+
+    local function isEnemyPlayer(player)
+        if player == nil or player == LPRB then return false end
+        local localTeamId = LPRB:GetAttribute('TeamID')
+        local theirTeamId = player:GetAttribute('TeamID')
+        if localTeamId ~= nil and theirTeamId ~= nil then return localTeamId ~= theirTeamId end
+        if LPRB.Team ~= nil and player.Team ~= nil then return LPRB.Team ~= player.Team end
+        return true
+    end
+    local function isTargetInvincible(entity)
+        local data = entity and rawget(entity, 'Data')
+        return data ~= nil and rawget(data, 'IsInvincible') == true
+    end
+    local function collectEnemies()
+        local out = {}
+        local controller = resolveFighterController()
+        local objects = controller and rawget(controller, 'Objects') or nil
+        if type(objects) ~= 'table' then return out end
+        for _, fighter in ipairs(objects) do
+            local ok, entry = pcall(function()
+                local player = rawget(fighter, 'Player')
+                local entity = rawget(fighter, 'Entity')
+                local model = entity and rawget(entity, 'Model') or nil
+                if not model then return nil end
+                if player ~= nil and not isEnemyPlayer(player) then return nil end
+                local hitboxHead = model:FindFirstChild('HitboxHead')
+                local hitboxBody = model:FindFirstChild('HitboxBody')
+                local rootPart = model:FindFirstChild('HumanoidRootPart') or hitboxBody
+                if not (hitboxHead and rootPart) then return nil end
+                local humanoid = model:FindFirstChildOfClass('Humanoid')
+                return {
+                    fighter = fighter,
+                    player = player,
+                    entity = entity,
+                    model = model,
+                    hitboxHead = hitboxHead,
+                    hitboxBody = hitboxBody,
+                    rootPart = rootPart,
+                    itemObserver = rawget(fighter, 'itemObserver') or rawget(fighter, 'ItemObserver'),
+                    alive = humanoid == nil or humanoid.Health > 0,
+                    invincible = isTargetInvincible(entity),
+                    hacker = false,
+                    equippedGunProjectile = false,
+                }
+            end)
+            if ok and entry then out[#out + 1] = entry end
+        end
+        return out
+    end
+    local function isValidTarget(entry)
+        return entry ~= nil and entry.alive and not entry.invincible and not entry.deflecting
+    end
+    local function selectTarget()
+        local enemies = collectEnemies()
+        local prioritizeHackers = Setting.PrioritizeHackers()
+        if prioritizeHackers then
+            for _, entry in ipairs(enemies) do
+                if entry.hacker and isValidTarget(entry) then return entry end
+            end
+        end
+        for _, entry in ipairs(enemies) do
+            if not (prioritizeHackers and entry.hacker) and isValidTarget(entry) then return entry end
+        end
+        return nil
+    end
+    local function hasTargets()
+        for _, entry in ipairs(collectEnemies()) do
+            if isValidTarget(entry) then return true end
+        end
+        return false
+    end
+
+    local function itemCategory(slotIndex)
+        if slotIndex == 1 then return 'Primary'
+        elseif slotIndex == 2 then return 'Secondary'
+        elseif slotIndex == 3 then return 'Melee' end
+        return nil
+    end
+    local function isCategoryEnabled(category)
+        if category == 'Primary' then return Setting.WeaponPrimary()
+        elseif category == 'Secondary' then return Setting.WeaponSecondary()
+        elseif category == 'Melee' then return Setting.WeaponMelee() end
+        return false
+    end
+    local function getAction(fighter)
+        if not fighter then return nil end
+        local items = rawget(fighter, 'Items')
+        if type(items) ~= 'table' then return nil end
+        local onEmpty = Setting.OnEmpty()
+        local priorityList = {}
+        local bestAttack, bestAttackPri, bestAttackIndex = nil, math.huge, nil
+        local bestSwap, bestSwapPri, bestSwapIndex = nil, math.huge, nil
+        local anyEnabled = false
+        for slotKey, item in next, items do
+            if type(item) == 'table' then
+                local category = itemCategory(slotKey)
+                if category ~= nil and isCategoryEnabled(category) then
+                    anyEnabled = true
+                    local priority = table.find(priorityList, category) or math.huge
+                    if itemType(item) == 'Gun' and itemAmmo(item) == 0 then
+                        if itemAmmoReserve(item) > 0 and priority < bestSwapPri then
+                            if onEmpty == 'Reload' then
+                                bestAttackPri = priority
+                                bestAttack = item
+                                bestAttackIndex = slotKey
+                            else
+                                bestSwap = item
+                                bestSwapPri = priority
+                                bestSwapIndex = slotKey
+                            end
+                        end
+                    elseif bestAttack == nil or priority < bestAttackPri then
+                        bestAttackPri = priority
+                        bestAttack = item
+                        bestAttackIndex = slotKey
+                    end
+                end
+            end
+        end
+        if not anyEnabled then return nil end
+        if bestAttack == nil then
+            if onEmpty == 'Swap' or bestSwap == nil then return nil end
+            if itemIsEquipped(bestSwap) then return { type = 'Reload', item = bestSwap, itemType = itemType(bestSwap), index = bestSwapIndex } end
+            return { type = 'Swap', item = bestSwap, itemType = itemType(bestSwap), index = bestSwapIndex }
+        end
+        local emptyGun = itemType(bestAttack) == 'Gun' and itemAmmo(bestAttack) == 0
+        if not itemIsEquipped(bestAttack) then return { type = 'Swap', item = bestAttack, itemType = itemType(bestAttack), index = bestAttackIndex } end
+        if emptyGun then return { type = 'Reload', item = bestAttack, itemType = itemType(bestAttack), index = bestAttackIndex } end
+        return { type = 'Attack', item = bestAttack, itemType = itemType(bestAttack), index = bestAttackIndex }
+    end
+
+    local ShootLock = {}
+    ShootLock.__index = ShootLock
+    function ShootLock.new() return setmetatable({ _lockedUntil = nil }, ShootLock) end
+    function ShootLock:ShouldFire(canFire, lockDuration)
+        local now = os.clock()
+        local locked = self._lockedUntil ~= nil and now < self._lockedUntil
+        if canFire then self._lockedUntil = now + lockDuration end
+        if not locked then locked = canFire end
+        return locked
+    end
+    function ShootLock:Reset() self._lockedUntil = nil end
+
+    local SPATIAL_BOUND = 4194304
+    local function outOfSpatialBound(pos)
+        return SPATIAL_BOUND <= math.abs(pos.X) or SPATIAL_BOUND <= math.abs(pos.Y) or SPATIAL_BOUND <= math.abs(pos.Z)
+    end
+    local SpatialLimitGate = {}
+    SpatialLimitGate.__index = SpatialLimitGate
+    function SpatialLimitGate.new() return setmetatable({ _measurements = {} }, SpatialLimitGate) end
+    function SpatialLimitGate:Tick(target)
+        local key = target.fighter or target
+        local m = self._measurements[key]
+        if m == nil then
+            m = { expectedDuration = 1 }
+            self._measurements[key] = m
+        end
+        local now = os.clock()
+        local entry = m.limitEntryTime
+        local hasAmmo = target.equippedAmmoState ~= false
+        if not outOfSpatialBound(target.rootPart.Position) then
+            if entry ~= nil then
+                if hasAmmo then m.expectedDuration = now - entry end
+                m.limitEntryTime = nil
+            end
+            return false
+        end
+        if entry == nil then
+            m.limitEntryTime = now
+            entry = now
+        end
+        if hasAmmo and (m.expectedDuration - Setting.Stability()) <= (now - entry) then return false end
+        return true
+    end
+
+    local function localShieldStance(fighter)
+        local items = fighter and rawget(fighter, 'Items') or nil
+        if type(items) ~= 'table' then return 'None' end
+        for _, item in next, items do
+            if type(item) == 'table' and itemName(item) == 'Riot Shield' then
+                if itemIsEquipped(item) then return 'Equipped' end
+                return 'Unequipped'
+            end
+        end
+        return 'None'
+    end
+    local function getDefensiveCFrame(cframe, stance, targetRootPart)
+        if stance == 'Equipped' then return CFrame.new(cframe.Position, targetRootPart.Position) end
+        if stance == 'Unequipped' then return CFrame.new(cframe.Position, cframe.Position + (cframe.Position - targetRootPart.Position)) end
+        return cframe
+    end
+    local function getDefensiveViewAngles(stance)
+        if stance == 'None' then return nil end
+        local pitch = (stance == 'Equipped') and 90 or -90
+        return { kind = 'Normalized', pitch = pitch, yaw = rbRandom:NextNumber(0, 360) }
+    end
+
+    local FAR_AXIS = 1073741824
+    local function ringPoint(anchor, minR, maxR)
+        local angle = rbRandom:NextNumber(0, 2 * math.pi)
+        local radius = rbRandom:NextNumber(minR, maxR)
+        return CFrame.new(anchor + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
+            * CFrame.fromOrientation(rbRandom:NextNumber(0, 2 * math.pi), rbRandom:NextNumber(0, 2 * math.pi), rbRandom:NextNumber(0, 2 * math.pi))
+    end
+    local function scatterFar(pos, anchorFromCharacter, baseRadius, radiusFactor)
+        local extra = baseRadius * radiusFactor
+        local anchor = anchorFromCharacter and pos or Vector3.new(0, pos.Y, 0)
+        local ring = ringPoint(anchor, baseRadius, baseRadius + extra)
+        local ringPos = ring.Position
+        local x, y, z = ringPos.X, ringPos.Y, ringPos.Z
+        local pick = rbRandom:NextInteger(1, 3)
+        if pick == 1 then x = FAR_AXIS
+        elseif pick == 2 then y = FAR_AXIS
+        else z = FAR_AXIS end
+        return ring - ringPos + Vector3.new(x, y, z)
+    end
+    local function randomEvade(clientCF)
+        return scatterFar(clientCF.Position, Setting.RandomAnchorFromCharacter(), Setting.RandomBaseRadius(), Setting.RandomRadiusFactor())
+    end
+    local function translocateEvade(clientCF, hasTargetsNow)
+        if not hasTargetsNow then return ringPoint(clientCF.Position, 10000, 1000000000) end
+        local chosen = nil
+        for _, part in ipairs(CollectionServiceRB:GetTagged('OutOfBoundsPart')) do
+            if part:GetAttribute('KillDelay') == 0 then
+                chosen = part
+                break
+            end
+        end
+        if chosen == nil then return ringPoint(clientCF.Position, 10000, 1000000000) end
+        return chosen.CFrame * CFrame.new(0, -chosen.Size.Y / 2 + Setting.TranslocateOffset(), 0)
+    end
+    local function depthOsc(range, freq)
+        return range.Min + (range.Max - range.Min) * ((math.sin(os.clock() * (2 * math.pi * freq)) + 1) * 0.5)
+    end
+    local function surfaceCFrame(surface, up, forward)
+        return CFrame.fromMatrix(surface.surfacePosition - surface.up * 0.01 - surface.up * up + surface.forward * forward, surface.right, surface.up, -surface.forward)
+    end
+    local PB_OVERLAP = OverlapParams.new()
+    PB_OVERLAP.FilterType = Enum.RaycastFilterType.Exclude
+    PB_OVERLAP.FilterDescendantsInstances = {}
+    PB_OVERLAP.BruteForceAllSlow = true
+    local PB_PROBE_SIZE = Vector3.new(5, 5, 5)
+    local function isBoundaryPart(part)
+        return part.Name == 'Barriers' or part:HasTag('OutOfBoundsPart') or part:HasTag('KillBrick')
+    end
+    local function hasBoundaryNear(pos)
+        for _, part in ipairs(WorkspaceRB:GetPartBoundsInBox(CFrame.new(pos), PB_PROBE_SIZE, PB_OVERLAP)) do
+            if isBoundaryPart(part) then return true end
+        end
+        return false
+    end
+    local function describeSurface(part)
+        local cf = part.CFrame
+        return { surfacePosition = (cf * CFrame.new(0, part.Size.Y / 2, 0)).Position, up = cf.UpVector, right = cf.RightVector, forward = cf.LookVector }
+    end
+
+    local ProjectileBreaker = {}
+    ProjectileBreaker.__index = ProjectileBreaker
+    function ProjectileBreaker.new()
+        return setmetatable({ _nextPositionCooldown = -1, _poolEnvironmentID = nil, _pool = {}, _processedParts = {}, _lastBreakSurface = nil }, ProjectileBreaker)
+    end
+    function ProjectileBreaker:BindEnvironment(envId)
+        self._poolEnvironmentID = envId
+        self._pool = {}
+        self._processedParts = {}
+    end
+    function ProjectileBreaker:_HasProjectileThreat()
+        for _, entry in ipairs(collectEnemies()) do
+            if entry.equippedGunProjectile then return true end
+        end
+        return false
+    end
+    function ProjectileBreaker:_ScanBatch(envId)
+        local depthForwardMax = PB_DEPTH_FORWARD.Min + PB_DEPTH_FORWARD.Max
+        local upMid = (PB_DEPTH_UP.Min + PB_DEPTH_UP.Max) * 0.5
+        local forwardMid = depthForwardMax * 0.5
+        local scanned = 0
+        local function consider(part)
+            if not (part:IsA('BasePart') and not self._processedParts[part]) then return end
+            self._processedParts[part] = true
+            scanned = scanned + 1
+            local surface = describeSurface(part)
+            if hasBoundaryNear(surfaceCFrame(surface, upMid, forwardMid).Position) then return end
+            self._pool[#self._pool + 1] = surface
+        end
+        for _, tagged in ipairs(CollectionServiceRB:GetTagged('RaycastWhitelist' .. tostring(envId))) do
+            if not isBoundaryPart(tagged) then
+                consider(tagged)
+                if 64 <= scanned or 30 <= #self._pool then return end
+                for _, descendant in ipairs(tagged:GetDescendants()) do
+                    if not isBoundaryPart(descendant) then
+                        consider(descendant)
+                        if 64 <= scanned or 30 <= #self._pool then return end
+                    end
+                end
+            end
+        end
+    end
+    function ProjectileBreaker:_BreakLine()
+        local envId = self._poolEnvironmentID
+        if envId == nil then return nil end
+        if #self._pool < 30 then self:_ScanBatch(envId) end
+        if #self._pool < 30 then return nil end
+        self._nextPositionCooldown = os.clock() + Setting.RepositionInterval()
+        return self._pool[rbRandom:NextInteger(1, #self._pool)]
+    end
+    function ProjectileBreaker:Compute(clientCF)
+        if os.clock() < self._nextPositionCooldown then
+            local last = self._lastBreakSurface
+            if last ~= nil then return surfaceCFrame(last, depthOsc(PB_DEPTH_UP, PB_DEPTH_UP_FREQ), depthOsc(PB_DEPTH_FORWARD, PB_DEPTH_FORWARD_FREQ)) end
+        end
+        if not self:_HasProjectileThreat() then
+            self._lastBreakSurface = nil
+            return scatterFar(clientCF.Position, PB_FALLBACK_ANCHOR_FROM_CHARACTER, PB_FALLBACK_BASE_RADIUS, PB_FALLBACK_RADIUS_FACTOR)
+        end
+        local breakLine = self:_BreakLine()
+        if breakLine == nil then return scatterFar(clientCF.Position, PB_FALLBACK_ANCHOR_FROM_CHARACTER, PB_FALLBACK_BASE_RADIUS, PB_FALLBACK_RADIUS_FACTOR) end
+        self._lastBreakSurface = breakLine
+        return surfaceCFrame(breakLine, depthOsc(PB_DEPTH_UP, PB_DEPTH_UP_FREQ), depthOsc(PB_DEPTH_FORWARD, PB_DEPTH_FORWARD_FREQ))
+    end
+    function ProjectileBreaker:ResetState()
+        self._nextPositionCooldown = -1
+        self._lastBreakSurface = nil
+    end
+
+    local function farMiss()
+        return CFrame.new(math.random(-1000000, 1000000), math.random(5000, 10000), math.random(-1000000, 1000000))
+    end
+    local HitscanStrategy = {}
+    HitscanStrategy.__index = HitscanStrategy
+    function HitscanStrategy.new(partGlue) return setmetatable({ _partGlue = partGlue, _shootLock = ShootLock.new() }, HitscanStrategy) end
+    function HitscanStrategy:Plan(dt, target, item, ourRootPart, canFire)
+        local hitboxHead = target.hitboxHead
+        local above = isAbove(target)
+        local offset = above and OFFSET_ABOVE or OFFSET_BELOW
+        local void = self._partGlue:Acquire(ourRootPart, hitboxHead)
+        self._gluedOurPart = ourRootPart
+        local cframe = above and (void + offset) or CFrame.new(void.Position + offset, hitboxHead.Position)
+        if not self._shootLock:ShouldFire(canFire, dt * Setting.ShootFrames()) then return farMiss(), nil end
+        local _, oy, oz = target.rootPart.CFrame:ToOrientation()
+        local pitch = above and PITCH_ABOVE or PITCH_BELOW
+        local aim1 = buildAim(above and AIM_ABOVE_ORIGIN or AIM_BELOW_ORIGIN, pitch, oy, oz)
+        local aim2 = buildAim(above and AIM_ABOVE_END or AIM_BELOW_END, pitch, oy, oz)
+        local objectId = itemObjectId(item)
+        local isRaycast = itemIsRaycast(item)
+        return cframe, function() fireGun(objectId, isRaycast, aim1, aim2, hitboxHead, AIM_EXTRA) end
+    end
+    function HitscanStrategy:ResetState()
+        self._shootLock:Reset()
+        if self._gluedOurPart ~= nil then
+            self._partGlue:Free(self._gluedOurPart)
+            self._gluedOurPart = nil
+        end
+    end
+
+    local BACKSTAB_WINDOW = 0.625
+    local BACKSTAB_COOLDOWN = 1.25
+    local MeleeStrategy = {}
+    MeleeStrategy.__index = MeleeStrategy
+    function MeleeStrategy.new(partGlue)
+        return setmetatable({ _partGlue = partGlue, _shootLock = ShootLock.new(), _hitboxWindowUntil = -1, _attackCooldown = -1 }, MeleeStrategy)
+    end
+    local function meleeViewAngles(px, oy) return { kind = 'Normalized', pitch = math.deg(px), yaw = math.deg(oy) } end
+    function MeleeStrategy:_RecordBackstab()
+        local now = os.clock()
+        self._hitboxWindowUntil = now + BACKSTAB_WINDOW
+        self._attackCooldown = now + BACKSTAB_COOLDOWN
+    end
+    function MeleeStrategy:Plan(dt, target, item, ourRootPart, canFire)
+        local hitboxHead = target.hitboxHead
+        local above = isAbove(target)
+        local offset = above and OFFSET_ABOVE or OFFSET_BELOW
+        local void = self._partGlue:Acquire(ourRootPart, hitboxHead)
+        self._gluedOurPart = ourRootPart
+        local cframe = above and (void + offset) or CFrame.new(void.Position + offset, hitboxHead.Position)
+        local px, oy, oz = target.rootPart.CFrame:ToOrientation()
+        local pitch = above and PITCH_ABOVE or PITCH_BELOW
+        local aim1 = buildAim(above and AIM_ABOVE_ORIGIN or AIM_BELOW_ORIGIN, pitch, oy, oz)
+        local aim2 = buildAim(above and AIM_ABOVE_END or AIM_BELOW_END, pitch, oy, oz)
+        local objectId = itemObjectId(item)
+        local now = os.clock()
+        if now < self._hitboxWindowUntil then
+            return cframe, meleeViewAngles(px, oy), function() fireMeleeHeavy(objectId, aim1, aim2, hitboxHead, AIM_EXTRA) end
+        end
+        if not self._shootLock:ShouldFire(canFire, dt * Setting.ShootFrames()) then return farMiss(), nil, nil end
+        if now < self._attackCooldown then return farMiss(), nil, nil end
+        if itemName(item) ~= 'Knife' then
+            return cframe, nil, function() fireMeleeAttack(objectId, aim1, aim2, hitboxHead, AIM_EXTRA) end
+        end
+        self:_RecordBackstab()
+        return cframe, meleeViewAngles(px, oy), function() fireMeleeHeavy(objectId, aim1, aim2, hitboxHead, AIM_EXTRA) end
+    end
+    function MeleeStrategy:ResetState()
+        self._hitboxWindowUntil = -1
+        self._attackCooldown = -1
+        self._shootLock:Reset()
+        if self._gluedOurPart ~= nil then
+            self._partGlue:Free(self._gluedOurPart)
+            self._gluedOurPart = nil
+        end
+    end
+
+    local ORIGINAL_FALLEN_PARTS_HEIGHT = nil
+    local function applyEnabledFFlags(enabled)
+        if enabled and ORIGINAL_FALLEN_PARTS_HEIGHT == nil then
+            ORIGINAL_FALLEN_PARTS_HEIGHT = WorkspaceRB.FallenPartsDestroyHeight
+        end
+        pcall(function()
+            WorkspaceRB.FallenPartsDestroyHeight = enabled and (0 / 0) or (ORIGINAL_FALLEN_PARTS_HEIGHT or -500)
+        end)
+        if rbSetFFlag then
+            pcall(rbSetFFlag, 'DFIntS2PhysicsSenderRate', enabled and '120' or '15')
+            pcall(rbSetFFlag, 'DFIntAssemblyHistoryBufferSize', enabled and '2147483648' or '15')
+            pcall(rbSetFFlag, 'DFIntAssemblyHistorySkipSize', enabled and '0' or '8')
+        end
+    end
+
+    local Controller = {}
+    Controller.__index = Controller
+    function Controller.new()
+        local partGlue = PartGlue.new()
+        return setmetatable({
+            _enabled = false,
+            _partGlue = partGlue,
+            _hitscanStrategy = HitscanStrategy.new(partGlue),
+            _meleeStrategy = MeleeStrategy.new(partGlue),
+            _projectileBreaker = ProjectileBreaker.new(),
+            _spatialLimitGate = SpatialLimitGate.new(),
+            _stateHook = StateHook.new(),
+            _characterController = nil,
+            _boundRootPart = nil,
+            _lastTargetWorld = nil,
+            _lastDefensiveViewAngles = nil,
+        }, Controller)
+    end
+    function Controller:SetEnabled(enabled)
+        if self._enabled == enabled then return end
+        self._enabled = enabled
+        applyEnabledFFlags(enabled)
+        self:_Reset()
+    end
+    function Controller:_ApplyForcedCrouch(on)
+        if on then self._stateHook:SetForced('IsCrouching', true)
+        else self._stateHook:ClearForced('IsCrouching', false) end
+    end
+    function Controller:_EnsureCharacterController()
+        local CharLocal, HumanoidRootPart = GetChar(), GetRoot()
+        if not HumanoidRootPart or HumanoidRootPart.Parent ~= CharLocal then
+            if self._characterController then
+                self._characterController:Destroy()
+                self._characterController = nil
+                self._boundRootPart = nil
+            end
+            return nil
+        end
+        if self._characterController == nil or self._boundRootPart ~= HumanoidRootPart then
+            if self._characterController then self._characterController:Destroy() end
+            self._characterController = CharacterController.new(HumanoidRootPart)
+            self._boundRootPart = HumanoidRootPart
+        end
+        return self._characterController
+    end
+    function Controller:_EvadePlan(clientCF, mode)
+        if mode == 'Off' then return {} end
+        if mode ~= 'ProjectileBreaker' then return { cframe = randomEvade(clientCF) } end
+        return { cframe = self._projectileBreaker:Compute(clientCF), shouldSkipDefense = true }
+    end
+    function Controller:_Plan(dt, action, target, ourRootPart, clientCF, mode)
+        local canFire = true
+        if target ~= nil then canFire = not self._spatialLimitGate:Tick(target) end
+        if action == nil then return self:_EvadePlan(clientCF, mode) end
+        if action.type == 'Swap' then
+            local plan = self:_EvadePlan(clientCF, mode)
+            local item, index = action.item, action.index
+            plan.weaponAction = function() equipItem(item, index) end
+            return plan
+        end
+        if action.type == 'Reload' then
+            local plan = self:_EvadePlan(clientCF, mode)
+            local item = action.item
+            plan.weaponAction = function() reloadItem(item) end
+            return plan
+        end
+        if target == nil then return self:_EvadePlan(clientCF, mode) end
+        if action.itemType == 'Melee' then
+            local cframe, viewAngles, weaponAction = self._meleeStrategy:Plan(dt, target, action.item, ourRootPart, canFire)
+            return { cframe = cframe, viewAngles = viewAngles, weaponAction = weaponAction, shouldSkipDefense = true, shouldForceCrouch = true }
+        end
+        if action.itemType ~= 'Gun' then return {} end
+        if itemIsReloading(action.item) then return self:_EvadePlan(clientCF, mode) end
+        local cframe, weaponAction = self._hitscanStrategy:Plan(dt, target, action.item, ourRootPart, canFire)
+        return { cframe = cframe, weaponAction = weaponAction, shouldForceCrouch = true, isAimPose = weaponAction ~= nil }
+    end
+    function Controller:_ApplyPlan(plan, target, characterController, fighter)
+        local cframe = plan.cframe
+        if cframe == nil or target == nil or plan.shouldSkipDefense then
+            characterController:SetServerCFrame(cframe)
+            characterController:SendViewAngles(20, plan.viewAngles)
+            return
+        end
+        local stance = localShieldStance(fighter)
+        characterController:SetServerCFrame(getDefensiveCFrame(cframe, stance, target.rootPart))
+        if plan.isAimPose or plan.shouldDefendInPlace then
+            self._lastDefensiveViewAngles = getDefensiveViewAngles(stance)
+        end
+        characterController:SendViewAngles(20, plan.viewAngles or self._lastDefensiveViewAngles)
+    end
+    function Controller:Update(dt)
+        local fighter = resolveLocalFighter()
+        local characterController = self:_EnsureCharacterController()
+        if fighter == nil or characterController == nil or not self._enabled then
+            self:_Reset()
+            return
+        end
+        if RivalsRuntimeBridge.IsReadyToFight and not RivalsRuntimeBridge.IsReadyToFight() then
+            self:_Reset()
+            return
+        end
+        local ourRootPart = self._boundRootPart
+        local clientCF = characterController:GetClientCFrame()
+        local mode = Setting.EvasionMode()
+        if mode == 'Translocate' then
+            self:_ApplyForcedCrouch(false)
+            characterController:SetServerCFrame(translocateEvade(clientCF, hasTargets()))
+            characterController:HeartbeatUpdate()
+            return
+        end
+        local target = selectTarget()
+        local action = getAction(fighter)
+        self._lastTargetWorld = target ~= nil and target.rootPart.Position or nil
+        local plan = self:_Plan(dt, action, target, ourRootPart, clientCF, mode)
+        self:_ApplyPlan(plan, target, characterController, fighter)
+        self:_ApplyForcedCrouch(plan.shouldForceCrouch == true)
+        if plan.weaponAction ~= nil then plan.weaponAction() end
+        characterController:HeartbeatUpdate()
+    end
+    function Controller:GetLastTargetWorld() return self._lastTargetWorld end
+    function Controller:_Reset()
+        self._lastTargetWorld = nil
+        self._lastDefensiveViewAngles = nil
+        self:_ApplyForcedCrouch(false)
+        self._meleeStrategy:ResetState()
+        self._hitscanStrategy:ResetState()
+        self._projectileBreaker:ResetState()
+        if self._characterController then
+            self._characterController:SetServerCFrame(nil)
+            self._characterController:SendViewAngles(20, nil)
+            self._characterController:HeartbeatUpdate()
+        end
+    end
+    function Controller:Destroy()
+        self:SetEnabled(false)
+        self:_Reset()
+        if self._characterController then
+            self._characterController:Destroy()
+            self._characterController = nil
+            self._boundRootPart = nil
+        end
+        self._partGlue:Destroy()
+        applyEnabledFFlags(false)
+    end
+
+    local controllerInstance = nil
+    local function ensureController()
+        if controllerInstance == nil then controllerInstance = Controller.new() end
+        return controllerInstance
+    end
+    function KiciaRagebot.IsEnabled()
+        if KiciaRagebot.CapsOk == nil then
+            KiciaRagebot.CapsOk = __kicia_hook_genv.KiciaHookCaps.gate('Ragebot', 'getgc', 'sethiddenproperty')
+        end
+        return KiciaRagebot.CapsOk == true
+    end
+    function KiciaRagebot.Update(dt)
+        local controller = ensureController()
+        local enabled = KiciaRagebot.IsEnabled()
+        if controller._enabled ~= enabled then controller:SetEnabled(enabled) end
+        controller:Update(dt or 0)
+    end
+    function KiciaRagebot.Reset() if controllerInstance then controllerInstance:_Reset() end end
+    function KiciaRagebot.Destroy()
+        if controllerInstance then
+            controllerInstance:Destroy()
+            controllerInstance = nil
+        end
+    end
+    RivalsRuntimeBridge.UpdateKiciaRagebot = KiciaRagebot.Update
+    RivalsRuntimeBridge.ResetKiciaRagebot = KiciaRagebot.Reset
+    RivalsRuntimeBridge.DestroyKiciaRagebot = KiciaRagebot.Destroy
+end
+
+initKicia({
+    RivalsRuntimeBridge = Bridge,
+    Options = Options,
+    Toggles = Toggles,
+    FighterDataCache = FighterDataCache,
+    GetChar = GetChar,
+    GetRoot = GetRoot,
+    Genv = Genv,
+})
+
+-- [[ 4. Cleanup & UI Construction (mini HUB Style) ]] --
+if CoreGui:FindFirstChild("mini_HVH") then CoreGui["mini_HVH"]:Destroy() end
+if CoreGui:FindFirstChild("w7w7_HVH") then CoreGui["w7w7_HVH"]:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "mini_HVH"
+sg.Parent = CoreGui
+sg.ResetOnSpawn = false
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Parent = sg
+MainFrame.Size = UDim2.new(0, 300, 0, 335)
+MainFrame.Position = UDim2.new(0.5, -150, 0.3, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+MainFrame.BackgroundTransparency = 0.15
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true 
+
+local Corner = Instance.new("UICorner", MainFrame)
+Corner.CornerRadius = UDim.new(0, 10)
+
+-- Rainbow Top Line
+local RainbowLine = Instance.new("Frame", MainFrame)
+RainbowLine.Size = UDim2.new(1, 0, 0, 3)
+RainbowLine.BorderSizePixel = 0
+local UIGradient = Instance.new("UIGradient", RainbowLine)
+UIGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.new(1,0,0)),
+    ColorSequenceKeypoint.new(0.5, Color3.new(0,1,0)),
+    ColorSequenceKeypoint.new(1, Color3.new(0,0,1))
+})
+
+-- Title
+local Title = Instance.new("TextLabel", MainFrame)
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.Text = "mini HUB : KICIA HVH"
+Title.TextColor3 = Color3.new(1, 1, 1)
+Title.Font = Enum.Font.Code
+Title.TextSize = 18
+Title.BackgroundTransparency = 1
+
+-- Y Position Realtime Display Label
+local YText = Instance.new("TextLabel", MainFrame)
+YText.Size = UDim2.new(1, 0, 0, 20)
+YText.Position = UDim2.new(0, 0, 0, 35)
+YText.Text = "Y-Pos: 0.0"
+YText.TextColor3 = Color3.fromRGB(0, 255, 150)
+YText.Font = Enum.Font.Code
+YText.TextSize = 14
+YText.BackgroundTransparency = 1
+
+-- Close Button
+local CloseBtn = Instance.new("TextButton", MainFrame)
+CloseBtn.Size = UDim2.new(0, 25, 0, 25)
+CloseBtn.Position = UDim2.new(1, -35, 0, 8)
+CloseBtn.Text = "×"
+CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+CloseBtn.TextColor3 = Color3.new(1, 1, 1)
+Instance.new("UICorner", CloseBtn)
+CloseBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
+
+-- UI Button Factory
+local function NewButton(name, yPos)
+    local Frame = Instance.new("Frame", MainFrame)
+    Frame.Size = UDim2.new(0, 160, 0, 30)
+    Frame.Position = UDim2.new(0.5, -80, 0, yPos)
+    Frame.BackgroundTransparency = 1
+
+    local Ind = Instance.new("Frame", Frame)
+    Ind.Size = UDim2.new(0, 8, 0, 8)
+    Ind.Position = UDim2.new(0, 0, 0.5, -4)
+    Ind.BackgroundColor3 = Color3.fromRGB(150, 0, 0)
+    Instance.new("UICorner", Ind).CornerRadius = UDim.new(1, 0)
+
+    local Btn = Instance.new("TextButton", Frame)
+    Btn.Size = UDim2.new(1, -15, 1, 0)
+    Btn.Position = UDim2.new(0, 15, 0, 0)
+    Btn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    Btn.Text = name .. " OFF"
+    Btn.TextColor3 = Color3.new(1, 1, 1)
+    Btn.Font = Enum.Font.GothamSemibold
+    Btn.TextSize = 12
+    Instance.new("UICorner", Btn)
+
+    return Btn, Ind
+end
+
+local function UpdateUI(btn, ind, state, name)
+    btn.Text = name .. (state and " ON" or " OFF")
+    ind.BackgroundColor3 = state and Color3.new(0, 1, 0) or Color3.new(0.6, 0, 0)
+end
+
+local function UpdateTPUI(btn, ind, mode)
+    if mode == 0 then
+        btn.Text = "TP: OFF"
+        ind.BackgroundColor3 = Color3.new(0.6, 0, 0)
+    elseif mode == 1 then
+        btn.Text = "TP: TARGET Y"
+        ind.BackgroundColor3 = Color3.new(0, 1, 0)
+    elseif mode == 2 then
+        btn.Text = "TP: FIXED Y"
+        ind.BackgroundColor3 = Color3.new(0, 0.8, 1)
+    end
+end
+
+-- UI Buttons
+local RageBtn, RageInd             = NewButton("RAGEBOT", 60)
+local TPBtn, TPInd                 = NewButton("TP", 100)
+local UnderBtn, UnderInd           = NewButton("UNDERGROUND", 140)
+local KickBtn, KickInd             = NewButton("KICK", 180)
+local MeleeBtn, MeleeInd           = NewButton("FAST MELEE", 220)
+local RapidBtn, RapidInd           = NewButton("RAPID FIRE", 260)
+
+-- Initialize Default States
+UpdateUI(RageBtn, RageInd, RageEnabled, "RAGEBOT")
+UpdateTPUI(TPBtn, TPInd, TpMode)
+UpdateUI(UnderBtn, UnderInd, UndergroundEnabled, "UNDERGROUND")
+UpdateUI(MeleeBtn, MeleeInd, FastMeleeEnabled, "FAST MELEE")
+UpdateUI(RapidBtn, RapidInd, RapidFireEnabled, "RAPID FIRE")
+
+-- Button Interactions
+RageBtn.MouseButton1Click:Connect(function()
+    RageEnabled = not RageEnabled
+    UpdateUI(RageBtn, RageInd, RageEnabled, "RAGEBOT")
+    if not RageEnabled and Bridge.KiciaRagebot then
+        Bridge.KiciaRagebot.Reset()
+    end
+end)
+
+TPBtn.MouseButton1Click:Connect(function()
+    TpMode = (TpMode + 1) % 3
+    UpdateTPUI(TPBtn, TPInd, TpMode)
+    if TpMode == 0 then
+        currentTarget = nil
+        FixedYPosition = nil
+    elseif TpMode == 2 then
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot then
+            FixedYPosition = myRoot.Position.Y
+        end
+    end
+end)
+
+UnderBtn.MouseButton1Click:Connect(function()
+    UndergroundEnabled = not UndergroundEnabled
+    UpdateUI(UnderBtn, UnderInd, UndergroundEnabled, "UNDERGROUND")
+end)
+
+KickBtn.MouseButton1Click:Connect(function()
+    KickEnabled = not KickEnabled
+    UpdateUI(KickBtn, KickInd, KickEnabled, "KICK")
+end)
+
+MeleeBtn.MouseButton1Click:Connect(function()
+    FastMeleeEnabled = not FastMeleeEnabled
+    UpdateUI(MeleeBtn, MeleeInd, FastMeleeEnabled, "FAST MELEE")
+end)
+
+RapidBtn.MouseButton1Click:Connect(function()
+    RapidFireEnabled = not RapidFireEnabled
+    UpdateUI(RapidBtn, RapidInd, RapidFireEnabled, "RAPID FIRE")
+end)
+
+-- Rainbow Line Animation
+RunService.RenderStepped:Connect(function()
+    UIGradient.Offset = Vector2.new(math.sin(tick()) * 0.5, 0)
+end)
+
+-- [[ 5. Rapid Fire Auto Shooting Helper ]] --
+local function getNearestHeadRF()
+	local root = GetRoot()
+	if not root then return nil, nil end
+	local bestHRP, bestHead, bd = nil, nil, math.huge
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and plr.Character then
+			local char = plr.Character
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if hum and hrp and hum.Health > 0 then
+				local a, b = LocalPlayer:GetAttribute("TeamID"), plr:GetAttribute("TeamID")
+				if not (a and b and a == b) then
+					local head = char:FindFirstChild("HitboxHead") or char:FindFirstChild("Head") or hrp
+					local d = (root.Position - hrp.Position).Magnitude
+					if d < bd then
+						bd = d
+						bestHRP = hrp
+						bestHead = head
+					end
+				end
+			end
+		end
+	end
+	return bestHead, bestHRP
+end
+
+local lastAutoShot = 0
+
+-- [[ 6. Main Execution Loops ]] --
+RunService.Heartbeat:Connect(function(dt)
+    -- Y Position Display Tracker
+    if Root then
+        YText.Text = string.format("Y-Pos: %.1f", Root.Position.Y)
+    else
+        YText.Text = "Y-Pos: N/A"
+    end
+
+    -- Kicia Ragebot Constant Update
+    if RageEnabled and Bridge.KiciaRagebot then
+        pcall(function() Bridge.KiciaRagebot.Update(dt) end)
+    end
+
+    -- Rapid Fire Loop
+    if RapidFireEnabled then
+        pcall(function()
+            refreshRF()
+            local lf = FC and FC.LocalFighter
+            if lf and lf.EquippedItem then
+                local item = lf.EquippedItem
+                if item.Info then forceZeroInfo(item.Info) end
+                for _, k in ipairs({"ShootCooldown", "AttackCooldown", "LastShoot", "LastAttack", "NextShot", "Cooldown"}) do
+                    if type(item[k]) == "number" then item[k] = 0 end
+                end
+
+                if isHoldingFire() and (tick() - lastAutoShot >= 0.05) then
+                    if Utility and EnumLibrary and UseItem then
+                        local ok, oid = pcall(function() return item:Get("ObjectID") end)
+                        local okE, se = pcall(function() return EnumLibrary:ToEnum("StartShooting") end)
+                        if ok and oid and okE and se ~= nil then
+                            local root = GetRoot()
+                            local from = root and root.Position or workspace.CurrentCamera.CFrame.Position
+                            local head = getNearestHeadRF()
+                            local to = head and head.Position or (from + workspace.CurrentCamera.CFrame.LookVector * 50)
+                            local e = Utility:EncodeCFrame(CFrame.new(from, to))
+                            local data = {
+                                [utf8.char(1)] = {
+                                    [utf8.char(0)] = e,
+                                    [utf8.char(1)] = e,
+                                    [utf8.char(2)] = head,
+                                    [utf8.char(3)] = Utility:EncodeCFrame(CFrame.new(0.43, 0.25, 0.42)),
+                                },
+                            }
+                            UseItem:FireServer(oid, se, data, nil)
+                            lastAutoShot = tick()
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
+    -- KICK Loop
+    if KickEnabled then
+        pcall(function()
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then
+                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        hrp.CFrame = TargetPos
+                        hrp.AssemblyLinearVelocity = Vector3.zero
+                    end
+                end
+            end
+            for p in pairs(Projectiles) do
+                if p and p.Parent then
+                    p.CFrame = TargetPos
+                    p.AssemblyLinearVelocity = Vector3.zero
+                else Projectiles[p] = nil end
+            end
+        end)
+    end
+
+    -- TP Loop（相手の真下＆めり込みTP処理）および 通常時のめり込み固定処理
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    
+    if myRoot then
+        local currentOffset = UndergroundEnabled and UndergroundOffset or 0
+
+        if TpMode > 0 and currentTarget and currentTarget.Character then
+            local targetRoot = currentTarget.Character:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                local targetGroundY = GetGroundY(targetRoot.Position, currentTarget.Character)
+                
+                if TpMode == 1 then
+                    -- 【Mode 1: TARGET Y】 相手の足元地面から1メートル(3.28 studs)めり込む
+                    local finalY = targetGroundY + currentOffset
+                    myRoot.CFrame = CFrame.new(targetRoot.Position.X, finalY, targetRoot.Position.Z) * targetRoot.CFrame.Rotation
+                elseif TpMode == 2 then
+                    -- 【Mode 2: FIXED Y】 高さを固定しつつめり込む
+                    if not FixedYPosition then
+                        FixedYPosition = targetGroundY + currentOffset
+                    end
+                    local targetPos = targetRoot.Position
+                    local targetRot = targetRoot.CFrame.Rotation
+                    myRoot.CFrame = CFrame.new(targetPos.X, FixedYPosition, targetPos.Z) * targetRot
+                end
+                myRoot.AssemblyLinearVelocity = Vector3.zero
+            end
+        elseif TpMode == 0 and UndergroundEnabled then
+            -- 【Mode 0: OFF かつ UNDERGROUND ON】 現在地の地面を判定し、正確に1メートル(3.28 studs)下で固定（無限落下を防ぐ）
+            local groundY = GetGroundY(myRoot.Position, myChar)
+            local targetY = groundY + currentOffset
+            
+            myRoot.CFrame = CFrame.new(myRoot.Position.X, targetY, myRoot.Position.Z) * myRoot.CFrame.Rotation
+        end
+    end
+end)
+
+-- TP Target Loop
+task.spawn(function()
+    while true do
+        if TpMode > 0 then
+            local plrs = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer then table.insert(plrs, p) end
+            end
+            for _, plr in ipairs(plrs) do
+                if TpMode == 0 then break end
+                if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+                    currentTarget = plr
+                    if TpMode == 2 and plr.Character:FindFirstChild("HumanoidRootPart") then
+                        local currentOffset = UndergroundEnabled and UndergroundOffset or 0
+                        local gY = GetGroundY(plr.Character.HumanoidRootPart.Position, plr.Character)
+                        FixedYPosition = gY + currentOffset
+                    end
+                    task.wait(1.5)
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- Projectile Tracker
+workspace.ChildAdded:Connect(function(obj)
+    if obj:IsA("BasePart") then
+        task.wait(0.1)
+        if obj.Name == "CoreProjectile" or obj.AssemblyLinearVelocity.Magnitude > 50 then
+            Projectiles[obj] = true
+        end
+    end
+end)
